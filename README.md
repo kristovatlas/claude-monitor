@@ -52,7 +52,7 @@ Click the icon for a detailed dropdown:
 ## Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/claude-monitor.git
+git clone https://github.com/kristovatlas/claude-monitor.git
 cd claude-monitor
 chmod +x install.sh
 ./install.sh
