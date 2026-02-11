@@ -8,6 +8,8 @@ A macOS menu bar app that shows your Claude subscription usage in real time — 
 
 Click the icon for a detailed dropdown:
 
+> **⚠️ Disclaimer:** This tool uses an undocumented Anthropic API endpoint and an internal OAuth client ID observed in Claude Code's network traffic. It is **not affiliated with or endorsed by Anthropic**. The API may change without notice. Review Anthropic's [Terms of Service](https://www.anthropic.com/terms) before use.
+
 ```
 ── ACCOUNT ──
   ●  Personal (Pro)
@@ -157,8 +159,7 @@ Config lives at `~/.config/claude-monitor/config.json` (created on first run):
     },
     "personal": {
       "label": "Personal (Pro)",
-      "source": "token",
-      "token": "sk-ant-oat01-...",
+      "source": "profile_keychain",
       "plan": "pro"
     }
   }
@@ -169,9 +170,9 @@ Config lives at `~/.config/claude-monitor/config.json` (created on first run):
 |-------|-------------|
 | `refresh_seconds` | How often to poll the API (default: 120). Safe to set as low as 30 — the endpoint is free. |
 | `active_profile` | Which profile is selected on launch. |
-| `profiles.*.source` | `"keychain"` = live from Keychain, `"token"` = snapshotted token. |
+| `profiles.*.source` | `"keychain"` = live from Keychain, `"profile_keychain"` = snapshotted in Keychain. |
 
-Click **⚙️ Edit Config…** in the dropdown to open it directly.
+Click **⚙️ Edit Config…** in the dropdown to open it directly. **No secrets are stored in the config file** — all tokens live in the macOS Keychain.
 
 ## How it works
 
@@ -192,4 +193,48 @@ The usage endpoint returns:
   "five_hour":    { "utilization": 24.0, "resets_at": "2026-02-10T23:59:59Z" },
   "seven_day":    { "utilization": 11.0, "resets_at": "2026-02-12T04:59:59Z" },
   "seven_day_opus":   { "utilization": 0.0, "resets_at": null },
-  "seven_d
+  "seven_day_sonnet": { "utilization": 0.0, "resets_at": null },
+  "seven_day_cowork": null,
+  "extra_usage": {
+    "is_enabled": true,
+    "monthly_limit": null,
+    "used_credits": 0.0,
+    "utilization": null
+  }
+}
+```
+
+All utilization values are percentages (0–100) calculated server-side by Anthropic. No local token counting or limit estimation.
+
+## Troubleshooting
+
+**No icon in menu bar**
+- Your menu bar might be full (especially with a notch). Try removing another icon to make room.
+- The installer verifies framework Python support. If it shows ✔ for AppKit, the icon should work.
+
+**"Token expired — re-login to Claude Code"**
+- The refresh token has expired (happens after ~2 weeks of inactivity). Run `claude`, log in, then try again.
+
+**"No Claude Code credentials found"**
+- Make sure Claude Code is installed and you've logged in at least once: `claude`
+
+**Dock icon appears instead of menu bar**
+- The app should auto-detect and re-launch with the framework Python binary. If it doesn't, try running directly with Homebrew Python:
+  ```bash
+  /opt/homebrew/bin/python3 claude_menubar.py
+  ```
+
+**Numbers seem wrong**
+- The percentages come directly from Anthropic's servers — they're the same numbers shown in the Claude desktop app. If they seem off, check Settings → Usage in Claude to compare.
+
+## Security
+
+- **No secrets in config files.** All OAuth tokens are stored in the macOS Keychain — the config JSON contains only metadata (profile names, plan types).
+- **Keychain access uses absolute paths** (`/usr/bin/security`) to prevent PATH injection attacks.
+- **Token refresh responses are validated** before being written to the Keychain — malformed responses are rejected.
+- **Config file is `chmod 600`** — readable only by the owning user.
+- **Undocumented API.** This tool uses an internal Anthropic endpoint and OAuth client ID reverse-engineered from Claude Code's network traffic. It could break if Anthropic changes their internal APIs, and use may be subject to their Terms of Service.
+
+## License
+
+MIT

@@ -1,51 +1,13 @@
 #!/usr/bin/env python3
 """
-Claude Code Menu Bar Monitor
-═════════════════════════════
-Real-time subscription usage in your macOS menu bar, using the same
-endpoint the Claude desktop app uses (Settings → Usage).
+Claude Monitor — macOS menu bar app for Claude subscription usage.
 
-Shows exact utilization percentages from Anthropic's servers — no
-token estimation or guesswork.
+Shows real-time 5-hour and 7-day utilization from Anthropic's servers,
+using the same API endpoint as the Claude desktop app (Settings → Usage).
+Supports multiple accounts with one-click switching.
 
-  🟢 12%  →  🟡 65%  →  🔴 87%
-
-Supports multiple accounts (personal / enterprise) with one-click
-switching from the menu bar.
-
-SETUP
-─────
-  pip3 install rumps requests
-
-  # If you have Claude Code installed & logged in, just run it:
-  python3 claude_menubar.py
-
-  # It auto-reads your OAuth token from macOS Keychain.
-
-MULTI-ACCOUNT
-─────────────
-  First run creates ~/.config/claude-monitor/config.json
-
-  To add a second account:
-  1. Log into that account in Claude Code:  claude /logout  then  claude
-  2. Run:  python3 claude_menubar.py --add-profile work "Work (Enterprise)"
-     — this snapshots the current keychain token into a new profile
-  3. Switch between profiles from the menu bar dropdown
-
-  Or edit config.json directly (see --help for format).
-
-  Tokens expire, so the app auto-refreshes them from the keychain
-  when the active profile is the "auto" (keychain) source.
-
-HOW IT WORKS
-────────────
-  Claude Code stores OAuth credentials in macOS Keychain under
-  "Claude Code-credentials". The token is used to call:
-
-    GET https://api.anthropic.com/api/oauth/usage
-
-  This returns real utilization percentages — the same data shown
-  in the Claude desktop app under Settings → Usage.
+See README.md for full documentation.
+https://github.com/YOUR_USERNAME/claude-monitor
 """
 
 import rumps
@@ -68,11 +30,18 @@ except ImportError:
 CONFIG_DIR  = Path.home() / ".config" / "claude-monitor"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
+# ⚠️  DISCLAIMER: This tool uses an undocumented Anthropic API endpoint
+# and an internal OAuth client ID observed in Claude Code's network traffic.
+# It is not affiliated with or endorsed by Anthropic. The API may change or
+# break without notice. Review Anthropic's Terms of Service before use.
+
 USAGE_URL    = "https://api.anthropic.com/api/oauth/usage"
 REFRESH_URL  = "https://console.anthropic.com/v1/oauth/token"
 CLIENT_ID    = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 
+SECURITY_BIN = "/usr/bin/security"  # absolute path — don't resolve via PATH
 KEYCHAIN_SVC = "Claude Code-credentials"
+PROFILE_KEYCHAIN_PREFIX = "claude-monitor-profile-"
 CREDS_FILE   = Path.home() / ".claude" / ".credentials.json"
 
 BAR_WIDTH        = 22
@@ -92,7 +61,7 @@ def _read_raw_creds():
     # Try Keychain first
     try:
         result = subprocess.run(
-            ["security", "find-generic-password", "-s", KEYCHAIN_SVC, "-w"],
+            [SECURITY_BIN, "find-generic-password", "-s", KEYCHAIN_SVC, "-w"],
             capture_output=True, text=True, timeout=5,
         )
         if result.returncode == 0 and result.stdout.strip():
@@ -117,11 +86,11 @@ def _write_keychain_creds(creds):
         creds_json = json.dumps(creds)
         # Delete old entry first (security won't overwrite)
         subprocess.run(
-            ["security", "delete-generic-password", "-s", KEYCHAIN_SVC],
+            [SECURITY_BIN, "delete-generic-password", "-s", KEYCHAIN_SVC],
             capture_output=True, timeout=5,
         )
         subprocess.run(
-            ["security", "add-generic-password",
+            [SECURITY_BIN, "add-generic-password",
              "-a", os.environ.get("USER", "claude"),
              "-s", KEYCHAIN_SVC,
              "-w", creds_json],
@@ -149,7 +118,14 @@ def _refresh_access_token(refresh_token):
             return None, None
 
         data = resp.json()
-        return data.get("access_token"), data.get("expires_at")
+        new_token = data.get("access_token")
+        new_expires = data.get("expires_at")
+        # Validate shape before returning — don't write garbage to Keychain
+        if not new_token or not isinstance(new_token, str) or not new_token.startswith("sk-ant-"):
+            return None, None
+        if new_expires is not None and not isinstance(new_expires, (int, float)):
+            return None, None
+        return new_token, new_expires
     except Exception:
         return None, None
 
@@ -288,24 +264,41 @@ def save_config(cfg):
 
 
 def add_profile_from_keychain(name, label):
-    """Snapshot current keychain token into a named profile."""
+    """Snapshot current keychain token into a profile-specific Keychain entry."""
     token, plan = read_keychain_token()
     if not token:
         print("❌ No Claude Code credentials found in Keychain.")
         print("   Log into Claude Code first, then retry.")
         sys.exit(1)
 
+    # Store token in Keychain under a profile-specific service name
+    # — never write secrets to the config JSON file
+    svc = f"{PROFILE_KEYCHAIN_PREFIX}{name}"
+    profile_creds = json.dumps({"accessToken": token, "plan": plan})
+    subprocess.run([SECURITY_BIN, "delete-generic-password", "-s", svc],
+                   capture_output=True, timeout=5)
+    result = subprocess.run(
+        [SECURITY_BIN, "add-generic-password",
+         "-a", os.environ.get("USER", "claude-monitor"),
+         "-s", svc, "-w", profile_creds],
+        capture_output=True, timeout=5,
+    )
+    if result.returncode != 0:
+        print("❌ Failed to write to Keychain.")
+        sys.exit(1)
+
+    # Config stores metadata only — no secrets
     cfg = load_config()
     cfg["profiles"][name] = {
         "label": label,
-        "source": "token",
-        "token": token,
+        "source": "profile_keychain",
         "plan": plan,
     }
     save_config(cfg)
     print(f"✅ Profile '{name}' added: {label} ({plan} plan)")
-    print(f"   Token snapshotted. If it expires, switch to this account")
-    print(f"   in Claude Code and run:  python3 {sys.argv[0]} --refresh-profile {name}")
+    print(f"   Token stored in macOS Keychain (not in config file).")
+    print(f"   If it expires, switch to this account in Claude Code and run:")
+    print(f"     python3 {sys.argv[0]} --refresh-profile {name}")
 
 
 def refresh_profile_token(name):
@@ -318,7 +311,17 @@ def refresh_profile_token(name):
     if name not in cfg["profiles"]:
         print(f"❌ Profile '{name}' not found.")
         sys.exit(1)
-    cfg["profiles"][name]["token"] = token
+
+    svc = f"{PROFILE_KEYCHAIN_PREFIX}{name}"
+    profile_creds = json.dumps({"accessToken": token, "plan": plan})
+    subprocess.run([SECURITY_BIN, "delete-generic-password", "-s", svc],
+                   capture_output=True, timeout=5)
+    subprocess.run(
+        [SECURITY_BIN, "add-generic-password",
+         "-a", os.environ.get("USER", "claude-monitor"),
+         "-s", svc, "-w", profile_creds],
+        capture_output=True, timeout=5,
+    )
     cfg["profiles"][name]["plan"] = plan
     save_config(cfg)
     print(f"✅ Token refreshed for '{name}' ({plan})")
@@ -472,11 +475,28 @@ class ClaudeMenuBar(rumps.App):
 
     def _get_token(self):
         profile = self.config["profiles"].get(self.active, {})
-        if profile.get("source") == "keychain":
+        source = profile.get("source", "keychain")
+
+        if source == "keychain":
             token, plan = read_keychain_token()
             return token, plan
-        else:
-            return profile.get("token"), profile.get("plan", "?")
+
+        if source == "profile_keychain":
+            svc = f"{PROFILE_KEYCHAIN_PREFIX}{self.active}"
+            try:
+                result = subprocess.run(
+                    [SECURITY_BIN, "find-generic-password", "-s", svc, "-w"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    data = json.loads(result.stdout.strip())
+                    return data.get("accessToken"), data.get("plan", "?")
+            except Exception:
+                pass
+            return None, None
+
+        # Legacy: inline token in config (pre-security-fix)
+        return profile.get("token"), profile.get("plan", "?")
 
     # ── Refresh ──────────────────────────────────────────────────
 
@@ -574,6 +594,7 @@ class ClaudeMenuBar(rumps.App):
 USAGE_TEXT = """
 Claude Code Menu Bar Monitor
 ═════════════════════════════
+⚠️  Uses an undocumented Anthropic API. Not affiliated with Anthropic.
 
 Usage:
   python3 claude_menubar.py                              Launch (auto-reads Keychain)
