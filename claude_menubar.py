@@ -48,6 +48,7 @@ BAR_WIDTH        = 22
 YELLOW_THRESHOLD = 50
 RED_THRESHOLD    = 80
 DEFAULT_REFRESH  = 120   # seconds — API is lightweight but be polite
+PROACTIVE_REFRESH_MS = 5 * 60 * 1000  # refresh 5 min before token expiry
 
 
 # ── Keychain / Credentials ───────────────────────────────────────
@@ -105,7 +106,12 @@ def _refresh_access_token(refresh_token):
     """
     Exchange a refresh token for a new access token via Anthropic's
     OAuth endpoint — the same flow Claude Code uses internally.
-    Returns (new_access_token, new_expires_at) or (None, None).
+    Returns (new_access_token, new_expires_at, new_refresh_token)
+    or (None, None, None).
+
+    The server may rotate the refresh token on each use (standard
+    OAuth 2.0 behaviour).  Callers MUST persist the new refresh
+    token — the old one may be invalidated immediately.
     """
     try:
         resp = requests.post(REFRESH_URL, json={
@@ -115,19 +121,20 @@ def _refresh_access_token(refresh_token):
         }, headers={"Content-Type": "application/json"}, timeout=15)
 
         if not resp.ok:
-            return None, None
+            return None, None, None
 
         data = resp.json()
-        new_token = data.get("access_token")
+        new_token   = data.get("access_token")
         new_expires = data.get("expires_at")
+        new_refresh = data.get("refresh_token")
         # Validate shape before returning — don't write garbage to Keychain
         if not new_token or not isinstance(new_token, str) or not new_token.startswith("sk-ant-"):
-            return None, None
+            return None, None, None
         if new_expires is not None and not isinstance(new_expires, (int, float)):
-            return None, None
-        return new_token, new_expires
+            return None, None, None
+        return new_token, new_expires, new_refresh
     except Exception:
-        return None, None
+        return None, None, None
 
 
 def read_keychain_token():
@@ -149,15 +156,17 @@ def read_keychain_token():
     if not token:
         return None, None
 
-    # Check if token is expired (expiresAt is in milliseconds)
+    # Check if token is expired or close to expiring (expiresAt is in ms)
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    if expires and now_ms > expires and refresh:
-        # Token is expired — try to refresh it
-        new_token, new_expires = _refresh_access_token(refresh)
+    if expires and now_ms > (expires - PROACTIVE_REFRESH_MS) and refresh:
+        # Token is expired or about to expire — refresh proactively
+        new_token, new_expires, new_refresh = _refresh_access_token(refresh)
         if new_token:
             oauth["accessToken"] = new_token
             if new_expires:
                 oauth["expiresAt"] = new_expires
+            if new_refresh:
+                oauth["refreshToken"] = new_refresh
             creds["claudeAiOauth"] = oauth
             _write_keychain_creds(creds)
             return new_token, plan
@@ -191,12 +200,14 @@ def fetch_usage(token):
             if creds:
                 refresh_tok = creds.get("claudeAiOauth", {}).get("refreshToken")
                 if refresh_tok:
-                    new_token, new_exp = _refresh_access_token(refresh_tok)
+                    new_token, new_exp, new_refresh = _refresh_access_token(refresh_tok)
                     if new_token:
                         # Update keychain and retry once
                         creds["claudeAiOauth"]["accessToken"] = new_token
                         if new_exp:
                             creds["claudeAiOauth"]["expiresAt"] = new_exp
+                        if new_refresh:
+                            creds["claudeAiOauth"]["refreshToken"] = new_refresh
                         _write_keychain_creds(creds)
 
                         resp2 = requests.get(USAGE_URL, headers={
@@ -638,11 +649,13 @@ def cmd_test():
         print(f"⚠️  Access token is expired (by {(now_ms - expires)//60000} min)")
         if oauth.get("refreshToken"):
             print("   Attempting auto-refresh…")
-            new_token, new_exp = _refresh_access_token(oauth["refreshToken"])
+            new_token, new_exp, new_refresh = _refresh_access_token(oauth["refreshToken"])
             if new_token:
                 oauth["accessToken"] = new_token
                 if new_exp:
                     oauth["expiresAt"] = new_exp
+                if new_refresh:
+                    oauth["refreshToken"] = new_refresh
                 creds["claudeAiOauth"] = oauth
                 _write_keychain_creds(creds)
                 print("   ✅ Token refreshed and saved to Keychain!")
